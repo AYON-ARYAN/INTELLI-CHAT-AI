@@ -11,6 +11,9 @@ from langchain.memory import ConversationBufferMemory
 import requests
 import logging
 import shutil
+from langchain_community.chat_models import ChatOllama
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationChain # Add this import
 
 # --- Configure Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -272,7 +275,10 @@ def initialize_session_state():
         "llm_general_chat": None,
         "llm_init_attempted": False,
         "retriever_ready": False,
-        "ollama_status_checked": False
+        "ollama_status_checked": False,
+        "all_conversations": [],  # <--- ADD THIS LINE: To store all past conversations
+        "active_conversation_index": -1,  # <--- ADD THIS LINE: To track which conversation is loaded (-1 for new)
+        "active_chat_type": None  # <--- ADD THIS LINE: 'document' or 'general'
     }
     for key, default_value in defaults.items():
         if key not in st.session_state:
@@ -325,11 +331,17 @@ def process_documents_and_create_retriever():
 def initialize_llm():
     llm = None
     try:
-        llm = ChatOllama(model=OLLAMA_MODEL_NAME, temperature=0.7)
-        test_response = llm.invoke("Are you ready?", config={'timeout': OLLAMA_TIMEOUT})
+        base_llm = ChatOllama(model=OLLAMA_MODEL_NAME, temperature=0.7)
+        test_response = base_llm.invoke("Are you ready?", config={'timeout': OLLAMA_TIMEOUT})
         logger.info(f"Ollama ({OLLAMA_MODEL_NAME}) test successful. Response: {test_response.content[:50]}...")
         st.session_state.ollama_status_checked = True
-        return llm
+
+        # Initialize memory for the general chat
+        general_chat_memory = ConversationBufferMemory(memory_key="history", return_messages=True)
+        # Create a ConversationChain for general chat
+        general_chat_chain = ConversationChain(llm=base_llm, memory=general_chat_memory, verbose=False) # Set verbose=True for debugging
+
+        return general_chat_chain # Return the chain, not just the base LLM
     except requests.exceptions.ConnectionError:
         st.error(
             f"**Ollama Server Error:** Cannot connect to Ollama. Please ensure `ollama serve` is running in your terminal.")
@@ -342,7 +354,6 @@ def initialize_llm():
         logger.error(f"LLM initialization error: {e}", exc_info=True)
         st.session_state.ollama_status_checked = True
         return None
-
 @st.cache_resource(show_spinner="Building document QA chain...")
 def create_qa_chain(_llm_instance, _retriever_instance):
     if _llm_instance is None or _retriever_instance is None:
@@ -610,13 +621,15 @@ with tabs[0]:
                 """, unsafe_allow_html=True)
                 st.markdown("---")
 
-# --- Web & General Chat Tab ---
-with tabs[1]:
+# --- Web & General Chat Tab --- <--- MOVE THIS BLOCK TO THE CORRECT INDENTATION LEVEL
+with tabs[1]: # This 'with' statement should be at the same level as 'with tabs[0]:'
     st.subheader("General questions or direct web search")
-    st.info("💡 Type `web search: your query` for a web search; otherwise, it's a general chat with the LLM.")
+    st.info(
+        "💡 Type ` web search: your query ` for a web search; otherwise, it's a general chat with the LLM.")
 
-    if not st.session_state.llm_general_chat:
-        st.warning("General chat is not active. Please ensure your Ollama server is running (with 'mistral' model). Check **Chatbot Status** above.")
+    if not st.session_state.llm_general_chat:  # This now holds the ConversationChain
+        st.warning(
+            "General chat is not active. Please ensure your Ollama server is running (with 'mistral' model). Check **Chatbot Status** above.")
     else:
         with st.form("web_general_chat_form", clear_on_submit=True):
             user_query_web = st.text_area(
@@ -629,6 +642,7 @@ with tabs[1]:
 
             if submit_button_web and user_query_web:
                 with st.spinner("IntelliChat is thinking..."):
+                    # Initialize answer_web here to ensure it's always defined
                     answer_web = ""
                     if user_query_web.lower().startswith("web search:"):
                         search_query = user_query_web.split("web search:", 1)[-1].strip()
@@ -636,30 +650,34 @@ with tabs[1]:
                         logger.info(f"Web search performed for: '{search_query}'")
                     else:
                         try:
-                            llm_response = st.session_state.llm_general_chat.invoke(user_query_web)
-                            answer_web = llm_response.content if hasattr(llm_response, 'content') else str(llm_response)
+                            # Invoke the ConversationChain, not the raw LLM
+                            llm_response = st.session_state.llm_general_chat.invoke(
+                                {"input": user_query_web})
+                            answer_web = llm_response.get("response",
+                                                          "No response found.")
                             logger.info(f"General chat query processed: '{user_query_web}'")
                         except Exception as e:
-                            st.error(f"An error occurred during general chat: {e}. Please check the console.")
+                            st.error(
+                                f"An error occurred during general chat: {e}. Please check the console.")
                             logger.error(f"Error in general chat: {e}", exc_info=True)
                             answer_web = "Error: LLM failed to generate a response."
 
-                st.session_state.web_chat_history.append({"question": user_query_web, "answer": answer_web})
-
-        st.markdown("---")
-        st.markdown("### Conversation History")
-        if not st.session_state.web_chat_history:
-            st.markdown("_No web/general chat history yet. Ask a question above!_")
-        else:
-            for chat in reversed(st.session_state.web_chat_history):
-                st.markdown(f"""
-                <div class="chat-message-container">
-                    <div class="chat-icon">🤔</div>
-                    <div class="user-message">{chat['question']}</div>
-                </div>
-                <div class="chat-message-container">
-                    <div class="chat-icon">✨</div>
-                    <div class="bot-message">{chat['answer']}</div>
-                </div>
-                """, unsafe_allow_html=True)
-                st.markdown("---")
+                st.session_state.web_chat_history.append(
+                    {"question": user_query_web, "answer": answer_web})
+    st.markdown("---")
+    st.markdown("### Conversation History")
+    if not st.session_state.web_chat_history:
+        st.markdown("_No web/general chat history yet. Ask a question above!_")
+    else:
+        for chat in reversed(st.session_state.web_chat_history):
+            st.markdown(f"""
+            <div class="chat-message-container">
+                <div class="chat-icon">🤔</div>
+                <div class="user-message">{chat['question']}</div>
+            </div>
+            <div class="chat-message-container">
+                <div class="chat-icon">✨</div>
+                <div class="bot-message">{chat['answer']}</div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.markdown("---")
